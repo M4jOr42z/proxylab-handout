@@ -31,6 +31,14 @@ typedef struct cache_bag {
 	int bag_size; 
 } cache_bag;
 
+/* temperary buffer for web objects */
+typedef struct web_buf {
+	int over_cacheable;
+	char buf[MAX_OBJECT_SIZE];
+	char *buf_index;
+	int buffered_bytes;
+} web_buf;
+
 /* function prototypes */
 /* cache node bag prototypes  */
 void init_cache_hits();
@@ -49,3 +57,6 @@ void evict_cache(int bytes);
 void cache_in(char *url, char *buf, int bytes);
 cache_node *find_cached(char *url);
 int cache_out(char *url, int client_fd);
+/* web_buf prototypes */
+void init_web_buf(web_buf *w_buf);
+void buffer(web_buf *w_buf, char *buf, int bytes);

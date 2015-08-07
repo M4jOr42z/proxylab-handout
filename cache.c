@@ -7,42 +7,31 @@
  * maximum object size: 100 KiB
  *
  * cache is maintained in a double-linked list of cache nodes
- * a queue
+ * a bag of cache node pointers is maintained for queuing up
+ * any cache hits happened in reader threads.
  * 
- * working cache for writing:
- * free_bytes, free cache size
- * ei_w, mutex for eviction and insertion on working cache
- * u_w, mutex for updating position
- * head, beginning of the cache
- * tail, end of the cache
- *
- * parallel list for reading:
- * read_cnt, count current number of readers
- * r_p, mutex for read_cnt
- * ei_p, mutex for eviction and insertion on parallel list
- * head, beginning of the list
- * tail, end of the list
- *
- * cache node structure:
+ * cache node:
  * url, id
  * buf, holds the actual web object
  * content_length, web object size
  * pre/succ, pointers to previous/next cache node
  *
+ * cache list:
+ * free_bytes, remaining available bytes
+ * head, list front
+ * tail, list rear
+ *
+ * cache bag:
+ * bag, array of cache node pointers
+ * bag_index, array index to the bag
+ * bag_size, array size
+ *
  * cache out operation:
- * lock reader mutex,
- * lock working cache eviction and insertion if first reader
- * unlock reader mutex,
- * read on parallel list, 
- * use match (if found) to answer client request,
- * lock udpating mutex,
- * update match position using working cache,
- * unlock updating mutex,
- * lock reader mutex,
- * unlock working cache eviction and insertion if last reader
- * unlock reader mutex.
- * 
- * cache in operation:
+ * multiple threads can access reader section to determine whether
+ * a cache hit. If so, cache node according to hit is collected in
+ * cache bag. Only one thread can access writer section to modify
+ * the cache list. All threads in reader section finish before
+ * any writer section begin. 
  * 
  */
 
@@ -124,6 +113,20 @@ void init_cache_list() {
 	cache.tail = NULL;
 }
 
+/* 
+ * deinit cache list
+ */
+void free_cache_list() {
+	cache_node *p = cache.head;
+	cache_node *p_succ;
+	while (p) {
+		p_succ = p->succ;
+		free(p->buf);
+		free(p);
+		p = p_succ;
+	}	
+}
+
 /*
  * initialize a working cache and its parallel
  */
@@ -133,23 +136,17 @@ void init_cache() {
 	init_cache_hits();
 	read_cnt = 0;
 	/* init semaphores */
-	Sem_init(&w);
-	Sem_init(&u);
-	Sem_init(&read_mutex);
+	Sem_init(&w, 0, 1);
+	Sem_init(&u, 0, 1);
+	Sem_init(&read_mutex, 0, 1);
 }
 
 /*
- * clear the cache
+ * clear all cache related data
  */
 void deinit_cache() {
-	cache_node *p = cache->head;
-	cache_node *p_succ;
-	while (p) {
-		p_succ = p->succ;
-		free(p->buf);
-		free(p);
-		p = p_succ;
-	}
+	free_cache_list();
+	free_cache_hits();
 }
 
 /*
@@ -160,7 +157,7 @@ void delete_node(cache_node *node) {
 		node->pre->succ = node->succ;
 	if (node->succ)
 		node->succ->pre = node->pre;
-	if (node == cache.tail)
+	else
 		cache.tail = node->pre;
 }
 
@@ -175,8 +172,8 @@ void insert_node(cache_node *node) {
 		cache.head = node;
 	}
 	else {
-		node.pre = NULL;
-		node.succ = NULL;
+		node->pre = NULL;
+		node->succ = NULL;
 		cache.head = node;
 		cache.tail = node;
 	}
@@ -184,7 +181,7 @@ void insert_node(cache_node *node) {
 
 /*
  * LRU policy: least used node is put in the tail of 
- * working list
+ * cache list
  */
 void evict_cache(int bytes) {
 	cache_node *lru_node;
@@ -195,13 +192,17 @@ void evict_cache(int bytes) {
 		cache.tail = lru_node->pre;
 		free(lru_node->buf);
 		free(lru_node);
+		lru_node = cache.tail;
 	}
 }
 
 /*
  * cache in the web object passed by proxy buffer
- * 1. if not enough space, evict least recently used nodes
- * 2. update the cached node's position according to LRU rule
+ * 1. update list ordering for queued cache hits in readers
+ * 2. if not enough space, evict least recently used nodes
+ * 3. create new node to hold the buffer data
+ * 4. insert the new node to cache list
+ * 5. update available bytes in the cache
  */
 void cache_in(char *url, char *buf, int bytes) {
 	cache_node *curr_n;
@@ -220,17 +221,17 @@ void cache_in(char *url, char *buf, int bytes) {
 	evict_cache(bytes);
 
 	/* create a new node to hold the cached in data */
-	cache_node *new_node = malloc(sizeof(cache_node *));
+	cache_node *new_node = malloc(sizeof(cache_node));
+	new_node->buf = malloc(bytes);
 	strcpy(new_node->url, url);
 	memcpy(new_node->buf, buf, bytes);
 	new_node->content_length = bytes;
 
 	/* insert the new node to front of working list */
 	insert_node(new_node);
-	cache->free_bytes -= bytes;
+	cache.free_bytes -= bytes;
 
-	V(&w);
-}
+	V(&w);}
 
 /*
  * traverse the list to find if a client request has been cached
@@ -253,7 +254,7 @@ cache_node *find_cached(char *url) {
  * return 0, if not cached
  */
 int cache_out(char *url, int client_fd) {
-	cache_node cached_node;
+	cache_node *cached_node;
 	int cached = 0;
 
 	P(&read_mutex);
@@ -267,7 +268,7 @@ int cache_out(char *url, int client_fd) {
 	if (cached_node) {
 		P(&u); 
 		cached = 1;
-		rio_writen(client_fd, cache_node->buf, cache_node->content_length);
+		rio_writen(client_fd, cached_node->buf, cached_node->content_length);
 		cache_hits_put(cached_node);
 		V(&u);
 	}
@@ -281,5 +282,26 @@ int cache_out(char *url, int client_fd) {
 	return cached;
 }
 
+/*
+ * helper buffer in proxy
+ */
+void buffer(web_buf *w_buf, char *buf, int bytes) {
+	if (!w_buf->over_cacheable) {
+		if ((w_buf->buffered_bytes+bytes) < MAX_OBJECT_SIZE) {
+			memcpy(w_buf->buf_index, buf, bytes);
+			w_buf->buf_index += bytes;
+			w_buf->buffered_bytes += bytes;
+		}
+		else
+			w_buf->over_cacheable = 1;
+	}
+}
 
-
+/*
+ * helper buffer init
+ */ 
+void init_web_buf(web_buf *w_buf) {
+	w_buf->over_cacheable = 0;
+	w_buf->buf_index = w_buf->buf;
+	w_buf->buffered_bytes = 0;
+}

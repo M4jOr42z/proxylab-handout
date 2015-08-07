@@ -1,16 +1,11 @@
 #include <stdio.h>
 #include "csapp.h"
-
-/* Recommended max cache and object sizes */
-#define MAX_CACHE_SIZE 1049000
-#define MAX_OBJECT_SIZE 102400
+#include "cache.h"
 
 /* You won't lose style points for including these long lines in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
 static const char *connection_hdr = "Connection: close\r\n";
 static const char *proxy_connection_hdr = "Proxy-Connection: close\r\n";
-// static const char *accept_hdr = "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n";
-// static const char *accept_encoding_hdr = "Accept-Encoding: gzip, deflate\r\n";
 
 /* user defined functions */
 void doit(int fd);
@@ -19,7 +14,7 @@ void clienterror(int fd, char *cause, char *errnum,
 int is_valid(char *buf);
 int read_requesthdrs(rio_t *rp, char *reqs);
 void parse_uri(char *url, char *hostname, char *port, char *uri);
-void forward_response(rio_t *rp, int client_fd);
+void forward_response(rio_t *rp, int client_fd, char *url);
 void *thread(void *vargp);
 
 int main(int argc, char **argv)
@@ -40,6 +35,9 @@ int main(int argc, char **argv)
     /* ignore SIGPIPE signal */
     signal(SIGPIPE, SIG_IGN);
 
+    /* initialize the cache */
+    init_cache();
+
     listenfd = Open_listenfd(argv[1]);
     while(1) {
         /* listen for incoming connections */
@@ -47,15 +45,17 @@ int main(int argc, char **argv)
         *connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
         Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, 
                      port, MAXLINE, 0);
-        printf("****************************************************************************\n");
         printf("Accepted connection from (%s, %s)\n", hostname, port);
         /* create a seperate thread to handle this request */
         Pthread_create(&tid, NULL, thread, connfd);
-        printf("****************************************************************************\n");
     }
     return 0;
 }
 
+/*
+ * thread to hanlde one HTTP transaction
+ * all inner functions used shoul be thread-safe
+ */
 void *thread(void *vargp) {
     int client_fd;
 
@@ -105,6 +105,12 @@ void doit(int fd) {
         return;
     }
 
+    /* check cache to see if request cached */
+    if (cache_out(url, fd)) {
+        printf("Serve with cached content\n");
+        return;
+    }
+
     /* parse the url, and retrieve hostname, port number, and uri for server */
     parse_uri(url, hostname, server_port, uri);
     printf("uri: %s\n", uri);
@@ -136,7 +142,7 @@ void doit(int fd) {
     printf("%s", reqs);
     
     /* forward server response to the client and close when finish */
-    forward_response(&rio_proxy, fd);
+    forward_response(&rio_proxy, fd, url);
     Close(proxy_fd);
 
     return;
@@ -225,11 +231,13 @@ int read_requesthdrs(rio_t *rp, char *reqs) {
 /*
  * forwards server's response to client
  */
-void forward_response(rio_t *rp, int client_fd) {
+void forward_response(rio_t *rp, int client_fd, char *url) {
     char buf[MAXBUF], hdr_name[MAXLINE], hdr_data[MAXLINE];
     int bytes;
     int content_length = 0;
     char content_type[MAXLINE];
+    web_buf w_buf;
+    init_web_buf(&w_buf);
 
     /* read response line */
     bytes = rio_readlineb(rp, buf, MAXLINE);
@@ -237,12 +245,14 @@ void forward_response(rio_t *rp, int client_fd) {
         printf("read response line failed or EOF encountered\n");
         return;
     }
-    bytes = rio_writen(client_fd, buf, strlen(buf));
+    bytes = rio_writen(client_fd, buf, bytes);
     if (bytes <= 0) {
         printf("forward response line failed\n");
         return;
     }
     printf("read response line: %s", buf);
+    /* buffer response line */
+    buffer(&w_buf, buf, bytes);
 
     /* forward response headers */
     while (1) {
@@ -257,6 +267,9 @@ void forward_response(rio_t *rp, int client_fd) {
             printf("forward response header failed\n");
             return;
         }
+        /* buffer response headers */
+        buffer(&w_buf, buf, bytes);
+
         /* empty line, response hdrs finish */
         if (!strcmp(buf, "\r\n")) 
             break;
@@ -271,8 +284,8 @@ void forward_response(rio_t *rp, int client_fd) {
             || !strcmp(hdr_name, "Content-length:"))
             content_length = atoi(hdr_data);
     }
-    // printf("content type: %s\n", content_type);
-    // printf("content length: %d\n", content_length);
+    printf("content type: %s\n", content_type);
+    printf("content length: %d\n", content_length);
 
     /* forward response body */
     printf("forward response body begin...\n");
@@ -287,7 +300,15 @@ void forward_response(rio_t *rp, int client_fd) {
             return;
         }
         printf("write %d bytes to client\n", bytes);
-    }
+        /* buffer response body */
+        buffer(&w_buf, buf, bytes);
+    }  
+
+    printf("buffer over size? %d\n", w_buf.over_cacheable);
+    printf("buffered content:\n%s", w_buf.buf);
+
+    if (!w_buf.over_cacheable)
+        cache_in(url, w_buf.buf, w_buf.buffered_bytes);
 }
 
 /*
