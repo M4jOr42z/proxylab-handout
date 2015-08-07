@@ -86,8 +86,10 @@ void doit(int fd) {
 
     /* read first line of HTTP request */
     Rio_readinitb(&rio_client, fd);
-    if (!Rio_readlineb(&rio_client, buf, MAXLINE))
+    if (rio_readlineb(&rio_client, buf, MAXLINE) < 0) {
+        printf("read request line failed\n");
         return;
+    }
 
     /* see if the request is valid */
     printf("read request line: %s", buf);
@@ -113,9 +115,9 @@ void doit(int fd) {
 
     /* parse the url, and retrieve hostname, port number, and uri for server */
     parse_uri(url, hostname, server_port, uri);
-    printf("uri: %s\n", uri);
-    printf("hostname: %s\n", hostname);
-    printf("server port: %s\n", server_port);
+    // printf("uri: %s\n", uri);
+    // printf("hostname: %s\n", hostname);
+    // printf("server port: %s\n", server_port);
 
     /* build the request line */
     sprintf(reqs, "GET %s HTTP/1.0\r\n", uri);
@@ -137,7 +139,10 @@ void doit(int fd) {
         return;
     }
     Rio_readinitb(&rio_proxy, proxy_fd);
-    Rio_writen(proxy_fd, reqs, strlen(reqs));
+    if (rio_writen(proxy_fd, reqs, strlen(reqs)) < 0) {
+        printf("write request failed\n");
+        return;
+    }
     printf("writing the request to server:\n");
     printf("%s", reqs);
     
@@ -150,17 +155,21 @@ void doit(int fd) {
 
 /*
  * determines whether if is a valid http request
- * a form other than <method> <uri> <version> or
- * a method not implemented is considered as invalid.
+ * valid form: <method> http://<hostname>/ <version
  * 1 for valid, 0 for not valid
  */
 int is_valid(char *buf) {
-    char *cp;
+    char *cp = buf;
 
-    if (*buf != ' ') {
+    if (*cp != ' ') {
         if ((cp = strchr(buf, ' '))) {
-            if (*(cp+1) != ' ' && strchr(cp+1, ' '))
-                return 1;
+            if (cp == strstr(cp, " http://")) {
+                cp += 8;
+                if (*cp != ' ') {
+                    if ((*cp != '/') && (strchr(cp, '/')))
+                        return 1;
+                }
+            }
         }
     }
     return 0;
@@ -234,8 +243,8 @@ int read_requesthdrs(rio_t *rp, char *reqs) {
 void forward_response(rio_t *rp, int client_fd, char *url) {
     char buf[MAXBUF], hdr_name[MAXLINE], hdr_data[MAXLINE];
     int bytes;
-    int content_length = 0;
-    char content_type[MAXLINE];
+    // int content_length = 0;
+    // char content_type[MAXLINE];
     web_buf w_buf;
     init_web_buf(&w_buf);
 
@@ -250,7 +259,7 @@ void forward_response(rio_t *rp, int client_fd, char *url) {
         printf("forward response line failed\n");
         return;
     }
-    printf("read response line: %s", buf);
+    // printf("read response line: %s", buf);
     /* buffer response line */
     buffer(&w_buf, buf, bytes);
 
@@ -261,7 +270,7 @@ void forward_response(rio_t *rp, int client_fd, char *url) {
             printf("read response header failed or EOF encountered\n");
             return;
         }
-        printf("read response header: %s", buf);
+        // printf("read response header: %s", buf);
         bytes = rio_writen(client_fd, buf, strlen(buf));
         if (bytes <= 0) {
             printf("forward response header failed\n");
@@ -277,18 +286,18 @@ void forward_response(rio_t *rp, int client_fd, char *url) {
         sscanf(buf, "%s %s", hdr_name, hdr_data);
         // printf("hdr_name: %s\n", hdr_name);
         // printf("hdr_data: %s\n", hdr_data);
-        if (!strcmp(hdr_name, "Content-Type:")
-            || !strcmp(hdr_name, "Content-type:"))
-            strcpy(content_type, hdr_data);
-        if (!strcmp(hdr_name, "Content-Length:")
-            || !strcmp(hdr_name, "Content-length:"))
-            content_length = atoi(hdr_data);
+        // if (!strcmp(hdr_name, "Content-Type:")
+        //     || !strcmp(hdr_name, "Content-type:"))
+        //     strcpy(content_type, hdr_data);
+        // if (!strcmp(hdr_name, "Content-Length:")
+        //     || !strcmp(hdr_name, "Content-length:"))
+        //     content_length = atoi(hdr_data);
     }
-    printf("content type: %s\n", content_type);
-    printf("content length: %d\n", content_length);
+    // printf("content type: %s\n", content_type);
+    // printf("content length: %d\n", content_length);
 
     /* forward response body */
-    printf("forward response body begin...\n");
+    // printf("forward response body begin...\n");
     while ((bytes = rio_readnb(rp, buf, MAXBUF))) {
         if (bytes < 0) {
             printf("read response body failed\n");
@@ -304,8 +313,8 @@ void forward_response(rio_t *rp, int client_fd, char *url) {
         buffer(&w_buf, buf, bytes);
     }  
 
-    printf("buffer over size? %d\n", w_buf.over_cacheable);
-    printf("buffered content:\n%s", w_buf.buf);
+    // printf("buffer over size? %d\n", w_buf.over_cacheable);
+    // printf("buffered content:\n%s", w_buf.buf);
 
     if (!w_buf.over_cacheable)
         cache_in(url, w_buf.buf, w_buf.buffered_bytes);
